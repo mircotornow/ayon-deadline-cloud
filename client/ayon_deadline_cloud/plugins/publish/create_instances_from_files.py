@@ -158,6 +158,8 @@ class CreateInstancesFromFiles(pyblish.api.ContextPlugin):
                 name=instance.name)
             self.log.info("Creating instance %s", instance.name)
             pyblish_instance.data.update(asdict(instance))
+            if "review" not in pyblish_instance.data["families"]:
+                pyblish_instance.data["families"].append("review")
             add_trait_representations(
                 pyblish_instance,
                 pyblish_instance.data.pop(
@@ -212,7 +214,7 @@ class CreateInstancesFromFiles(pyblish.api.ContextPlugin):
         """
         return StandardRepresentation(
             name=reminder_path.stem,
-            ext=reminder_path.suffix,
+            ext=reminder_path.suffix.lstrip("."),
             files=reminder_path.name,
             stagingDir=reminder_path.parent.as_posix(),
             tags=["review"]
@@ -301,7 +303,9 @@ class CreateInstancesFromFiles(pyblish.api.ContextPlugin):
             ext=col.tail.lstrip("."),
             files=files,
             stagingDir=staging_dir.as_posix(),
-            tags=["review"]
+            tags=["review"],
+            frameStart=min(col.indexes),
+            frameEnd=max(col.indexes),
         )
 
     def _make_collection_representations(
@@ -541,7 +545,11 @@ class CreateInstancesFromFiles(pyblish.api.ContextPlugin):
             # we'll use the same logic as if it is a single reminder
             rems = [path.name]
         else:
-            files = list(path.glob("*"))
+            files = [
+                file_path
+                for file_path in path.rglob("*")
+                if file_path.is_file()
+            ]
             if not files:
                 msg = f"Provided path {path} has no files."
                 raise KnownPublishError(msg)

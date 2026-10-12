@@ -16,6 +16,8 @@ class StandardRepresentation:
     files: Union[str, list[str]]
     stagingDir: str
     tags: list[str]
+    frameStart: int | None = None
+    frameEnd: int | None = None
 
 
 @dataclass
