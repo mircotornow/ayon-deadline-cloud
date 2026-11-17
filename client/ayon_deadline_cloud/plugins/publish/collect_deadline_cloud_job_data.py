@@ -12,6 +12,10 @@ from ayon_core.pipeline.publish import (
     AYONPyblishPluginMixin,
 )
 from ayon_deadline_cloud.api import auto_detect_conda_packages
+from ayon_deadline_cloud.api.environment import (
+    VRAY_STANDALONE_CONDA_PACKAGE,
+    _has_vray_standalone_steps,
+)
 from ayon_deadline_cloud.api.submitter_bridge import (
     HoudiniSetting,
     get_submitter_bridge,
@@ -120,7 +124,10 @@ class CollectDeadlineCloudJobData(
         )
         settings = submitter_bg.submitter_settings
         queue_parameters: list[dict[str, Any]] = (
-            submitter_bg.get_queue_parameters()
+            submitter_bg.get_queue_parameters(
+                farm_id=dc_settings.get("farm_id") or None,
+                queue_id=dc_settings.get("queue_id") or None,
+            )
         )
 
         asset_references = AssetReferences(
@@ -134,12 +141,73 @@ class CollectDeadlineCloudJobData(
         # update AssetReferences object
         asset_references = AssetReferences.from_dict(asset_refs_dict)
 
+        if (
+            instance.context.data.get("hostName") == "maya"
+            and not settings.output_path
+        ):
+            from deadline.maya_submitter.scene import Scene
+
+            settings.output_path = (
+                self._resolve_output_path(asset_references.output_directories)
+                or Scene.output_path()
+            )
+
         attr_values = self.get_attr_values_from_data(instance.data)
 
         job_template = self._build_job_template(settings, instance)
         parameter_values = submitter_bg.get_parameter_values_for_submission(
             settings, queue_parameters
         )
+        if (
+            instance.context.data.get("hostName") == "maya"
+            and _has_vray_standalone_steps(job_template)
+        ):
+            from deadline.maya_submitter.maya_render_submitter import (
+                get_submit_render_layers,
+            )
+            from deadline.maya_submitter.render_layers import LayerSelection
+            from deadline.maya_submitter.scene import Scene
+            from deadline.maya_submitter.vray_export import (
+                export_vrscene,
+                vrscene_asset_paths,
+                vrscene_path,
+                vrscene_referenced_asset_paths,
+            )
+
+            selected_layers = get_submit_render_layers(
+                settings.render_layer_selection == LayerSelection.CURRENT
+            )
+            for layer_data in selected_layers:
+                if layer_data.renderer_name != "vray":
+                    continue
+                scene_path = vrscene_path(
+                    settings.output_path, layer_data.display_name
+                )
+                export_vrscene(
+                    scene_path,
+                    layer_data.name,
+                    layer_data.renderable_camera_names[0],
+                )
+                asset_references.input_filenames.update(
+                    vrscene_asset_paths(scene_path)
+                )
+                asset_references.input_filenames.update(
+                    vrscene_referenced_asset_paths(scene_path)
+                )
+                # V-Ray can store large scene data in sidecar files when
+                # misc_sidecarFilesOn is enabled. Include the whole dedicated
+                # export directory so those chunk files reach the worker.
+                asset_references.input_directories.add(
+                    scene_path.parent.as_posix()
+                )
+            ocio_config = Scene.ocio_config_file()
+            if ocio_config and os.path.isfile(ocio_config):
+                asset_references.input_filenames.add(os.path.normpath(ocio_config))
+
+            asset_refs_dict = submitter_bg.get_asset_references_for_submission(
+                asset_references
+            )
+            asset_references = AssetReferences.from_dict(asset_refs_dict)
         pv_by_name: dict[str, dict] = {
             pv["name"]: pv for pv in parameter_values
         }
@@ -265,7 +333,7 @@ class CollectDeadlineCloudJobData(
         self._apply_instance_attrs(
             instance_attrs, template_param_names, pv_by_name)
         self._apply_conda_overrides(
-            dc_settings, template_param_names, pv_by_name)
+            dc_settings, template_param_names, pv_by_name, job_template)
         self._apply_auto_conda(job_template, pv_by_name)
 
         extra_conda_packages = attr_values.get(
@@ -402,6 +470,7 @@ class CollectDeadlineCloudJobData(
         dc_settings: dict[str, Any],
         template_param_names: set[str],
         pv_by_name: dict[str, dict],
+        job_template: dict[str, Any],
     ) -> None:
         """Apply AYON settings overrides for Conda parameters.
 
@@ -453,6 +522,8 @@ class CollectDeadlineCloudJobData(
             host_name=get_current_host_name(),
             job_template=job_template,
         )
+        if _has_vray_standalone_steps(job_template):
+            auto_conda = VRAY_STANDALONE_CONDA_PACKAGE
         if auto_conda:
             self.log.info(
                 "Auto-detected CondaPackages from scene: %s", auto_conda)

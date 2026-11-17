@@ -3,6 +3,8 @@ from __future__ import annotations
 
 from typing import Any
 
+VRAY_STANDALONE_CONDA_PACKAGE = "vray-standalone=7.40.09"
+
 
 def _extract_renderers(job_template: dict[str, Any]) -> set[str]:
     """Extract renderers for a given job template.
@@ -29,6 +31,25 @@ def _extract_renderers(job_template: dict[str, Any]) -> set[str]:
     return renderers
 
 
+def _has_vray_standalone_steps(job_template: dict[str, Any]) -> bool:
+    """Return whether the template contains direct V-Ray actions or environments."""
+    for step in job_template.get("steps", []):
+        for env in step.get("stepEnvironments", []):
+            if env.get("name") == "V-Ray Standalone":
+                return True
+            if env.get("variables", {}).get("VRAY_RENDERER") == "vray":
+                return True
+        for action in step.get("script", {}).get("actions", {}).values():
+            if action.get("command") == "vray":
+                return True
+        for ef in step.get("script", {}).get("embeddedFiles", []):
+            name = ef.get("name", "").lower()
+            filename = ef.get("filename", "").lower()
+            if "vray" in name or "vray" in filename:
+                return True
+    return False
+
+
 class HostCondaPackages:
     """Implementation of conda package detection for different hosts.
 
@@ -50,6 +71,9 @@ class HostCondaPackages:
             A list of conda packages for Maya
 
         """
+        if _has_vray_standalone_steps(self._job_template):
+            return [VRAY_STANDALONE_CONDA_PACKAGE]
+
         from deadline.maya_submitter._version import (  # noqa: PLC2701
             version_tuple as adaptor_version_tuple,
         )

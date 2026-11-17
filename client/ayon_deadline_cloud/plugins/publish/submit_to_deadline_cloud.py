@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any, ClassVar
 import ayon_deadline_cloud.version
 import pyblish.api
 from deadline.client.api import create_job_from_job_bundle
+from deadline.client.config import config_file
 from deadline.client.job_bundle._yaml import (  # noqa: PLC2701
     deadline_yaml_dump,
 )
@@ -83,6 +84,20 @@ class SubmitToDeadlineCloud(pyblish.api.InstancePlugin):
                 # to take the snapshot without submitting:
                 # "debug_snapshot_dir": "C:\\debug\\AWS_DC_snapshots"
             }
+            submitter_settings = instance.context.data.get(
+                "deadline_cloud_submitter_settings", {}
+            )
+            farm_id = submitter_settings.get("default_farm_id")
+            queue_id = submitter_settings.get("queue_id")
+            if farm_id and queue_id:
+                submission_config = config_file.read_config()
+                config_file.set_setting(
+                    "defaults.farm_id", farm_id, submission_config
+                )
+                config_file.set_setting(
+                    "defaults.queue_id", queue_id, submission_config
+                )
+                kwargs["config"] = submission_config
             if instance.context.data["hostName"] != "houdini":
                 kwargs["known_asset_paths"] = known_paths
                 kwargs["interactive_confirmation_callback"] = (

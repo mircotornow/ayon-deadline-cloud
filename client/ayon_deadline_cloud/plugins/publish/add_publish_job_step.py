@@ -143,6 +143,9 @@ class AddPublishingStep(pyblish.api.InstancePlugin):
                             os.environ["AYON_STUDIO_BUNDLE_NAME"]
                         ),
                         "AYON_BUNDLE_NAME": os.environ["AYON_BUNDLE_NAME"],
+                        "AYON_PROJECT_NAME": "{{Param.projectName}}",
+                        "AYON_FOLDER_PATH": "{{Param.folderPath}}",
+                        "AYON_TASK_NAME": "{{Param.taskName}}",
                     },
                 },
             ],

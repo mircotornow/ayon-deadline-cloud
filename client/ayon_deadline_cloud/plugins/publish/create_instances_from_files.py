@@ -364,12 +364,29 @@ class CreateInstancesFromFiles(pyblish.api.ContextPlugin):
             groups.setdefault(key, []).append(col)
 
         instances: list[InstanceData] = []
+        product_variant = self._context.data.get("productVariant")
+        is_single_group = len(groups) == 1
+
         for (head, _padding, _indexes), group_cols in groups.items():
             # Strip trailing separators from the head to get the clean file
             # stem, then split into staging directory and variant name.
             head_path = Path(head.rstrip("._- "))
             staging_dir = head_path.parent
-            variant = head_path.name  # e.g. "render" from "/path/to/render"
+            element_name = head_path.name  # e.g. "render" from "/path/to/render"
+
+            if is_single_group and product_variant:
+                variant = product_variant
+            elif product_variant:
+                if element_name.lower() in (
+                    "beauty", "main", "render", product_variant.lower()
+                ):
+                    variant = product_variant
+                elif product_variant.lower() in element_name.lower():
+                    variant = element_name
+                else:
+                    variant = f"{product_variant}_{element_name}"
+            else:
+                variant = element_name
 
             representations = [
                 self._make_collection_representations(
@@ -490,10 +507,24 @@ class CreateInstancesFromFiles(pyblish.api.ContextPlugin):
         # there is no correlation between the file names, create separate
         # instance for each of them
         instances = []
+        product_variant = self._context.data.get("productVariant")
         for reminder_path in reminder_paths:
             representations = self._make_representations(
                 reminder_path
             )
+
+            stem = reminder_path.stem
+            if product_variant:
+                if stem.lower() in (
+                    "beauty", "main", "render", product_variant.lower()
+                ):
+                    variant = product_variant
+                elif product_variant.lower() in stem.lower():
+                    variant = stem
+                else:
+                    variant = f"{product_variant}_{stem}"
+            else:
+                variant = stem
 
             product_name = get_product_name(
                 project_name=self._context.data["projectName"],
@@ -502,7 +533,7 @@ class CreateInstancesFromFiles(pyblish.api.ContextPlugin):
                 product_base_type=self._context.data["productBaseType"],
                 product_type="render",
                 host_name=self._context.data["hostName"],
-                variant=self._context.data["productVariant"],
+                variant=variant,
             )
 
             instances.append(
@@ -515,7 +546,7 @@ class CreateInstancesFromFiles(pyblish.api.ContextPlugin):
                     families=["render", "review"],
                     folderPath=self._context.data["folderPath"],
                     task=self._context.data["task"],
-                    variant=self._context.data["productVariant"],
+                    variant=variant,
                     productBaseType=self._context.data["productBaseType"],
                     productType=self._context.data["productBaseType"],
                     productName=product_name,
@@ -549,6 +580,7 @@ class CreateInstancesFromFiles(pyblish.api.ContextPlugin):
                 file_path
                 for file_path in path.rglob("*")
                 if file_path.is_file()
+                and file_path.suffix.lower() != ".vrscene"
             ]
             if not files:
                 msg = f"Provided path {path} has no files."
@@ -557,7 +589,8 @@ class CreateInstancesFromFiles(pyblish.api.ContextPlugin):
             cols: list[clique.Collection]
             rems: list[str]
             cols, rems = clique.assemble(
-                [f.as_posix() for f in files]
+                [f.as_posix() for f in files],
+                minimum_items=1,
             )
 
         instances: list[InstanceData] = []

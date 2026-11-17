@@ -40,8 +40,14 @@ from .render_layers import (
     render_setup_include_all_lights,
     LayerSelection,
 )
+from .vray_export import (
+    export_vrscene,
+    vrscene_asset_paths,
+    vrscene_path,
+    vrscene_referenced_asset_paths,
+)
 from .cameras import get_renderable_camera_names, ALL_CAMERAS
-from ._version import version, version_tuple as adaptor_version_tuple
+from ._version import version
 from .ui.components.scene_settings_tab import SceneSettingsWidget
 from deadline.client.job_bundle.submission import AssetReferences
 import time
@@ -64,6 +70,11 @@ class RenderLayerData:
     image_width_parameter_name: Optional[str]
     image_height_parameter_name: Optional[str]
     image_resolution: tuple[int, int]
+
+
+def _vrscene_parameter_name(layer_data: RenderLayerData) -> str:
+    """Return the OpenJD parameter name for a layer's exported scene."""
+    return f"{layer_data.display_name}VRSceneFile"
 
 
 def _get_job_template(
@@ -204,6 +215,20 @@ def _get_job_template(
         }
         job_template["parameterDefinitions"].append(camera_param)
 
+    for layer_data in render_layers:
+        if layer_data.renderer_name != "vray":
+            continue
+        job_template["parameterDefinitions"].append(
+            {
+                "name": _vrscene_parameter_name(layer_data),
+                "type": "PATH",
+                "objectType": "FILE",
+                "dataFlow": "IN",
+                "userInterface": {"control": "HIDDEN"},
+                "description": "Locally exported V-Ray scene.",
+            }
+        )
+
     # Replicate the default step, once per render layer, and adjust its settings
     default_step = job_template["steps"][0]
     job_template["steps"] = []
@@ -219,6 +244,112 @@ def _get_job_template(
             parameter_space["taskParameterDefinitions"][0]["range"] = (
                 "{{Param." + layer_data.frames_parameter_name + "}}"
             )
+
+        if layer_data.renderer_name == "vray":
+            safe_layer_name = "".join(
+                character if character.isalnum() or character in "._-" else "_"
+                for character in layer_data.display_name
+            )
+            vrscene_file_name = f"{safe_layer_name}.vrscene"
+            vrscene_param_name = _vrscene_parameter_name(layer_data)
+
+            has_ocio = any(
+                param.get("name") == "OCIOConfigFile"
+                for param in job_template.get("parameterDefinitions", [])
+            )
+            ocio_block = ""
+            if has_ocio:
+                ocio_block = """
+# Configure Color Management (OCIO) if provided
+OCIO_PARAM="{{Param.OCIOConfigFile}}"
+if [ -n "$OCIO_PARAM" ] && [ -f "$OCIO_PARAM" ]; then
+    export OCIO="$OCIO_PARAM"
+    echo "Using OCIO config: $OCIO"
+elif [ -n "$OCIO_PARAM" ]; then
+    OCIO_NAME="$(basename "$OCIO_PARAM")"
+    FOUND_OCIO="$(find "{{Session.WorkingDirectory}}" -name "$OCIO_NAME" 2>/dev/null | head -n 1 || true)"
+    if [ -n "$FOUND_OCIO" ] && [ -f "$FOUND_OCIO" ]; then
+        export OCIO="$FOUND_OCIO"
+        echo "Found staged OCIO config: $OCIO"
+    fi
+fi
+"""
+
+            vray_script = f"""#!/bin/bash
+set -euo pipefail
+
+echo "=============================================="
+echo "Starting V-Ray Standalone Task"
+echo "=============================================="
+
+# 1. Resolve VRScene file path
+VRSCENE_NAME="{vrscene_file_name}"
+VRSCENE_PATH="{{{{Param.{vrscene_param_name}}}}}"
+
+if [ ! -f "$VRSCENE_PATH" ]; then
+    echo "VRScene not found at parameter path: $VRSCENE_PATH"
+    echo "Searching in session directory: {{{{Session.WorkingDirectory}}}} ..."
+    FOUND="$(find "{{{{Session.WorkingDirectory}}}}" -name "$VRSCENE_NAME" 2>/dev/null | head -n 1 || true)"
+    if [ -n "$FOUND" ] && [ -f "$FOUND" ]; then
+        VRSCENE_PATH="$FOUND"
+    else
+        echo "Searching across /sessions ..."
+        FOUND="$(find /sessions -name "$VRSCENE_NAME" 2>/dev/null | head -n 1 || true)"
+        if [ -n "$FOUND" ] && [ -f "$FOUND" ]; then
+            VRSCENE_PATH="$FOUND"
+        else
+            echo "Searching in /tmp ..."
+            FOUND="$(find /tmp -name "$VRSCENE_NAME" 2>/dev/null | head -n 1 || true)"
+            if [ -n "$FOUND" ] && [ -f "$FOUND" ]; then
+                VRSCENE_PATH="$FOUND"
+            fi
+        fi
+    fi
+fi
+
+if [ -z "$VRSCENE_PATH" ] || [ ! -f "$VRSCENE_PATH" ]; then
+    echo "ERROR: Could not locate $VRSCENE_NAME in session or system paths!" >&2
+    echo "Current working directory: $(pwd)" >&2
+    echo "Contents of session directory:" >&2
+    ls -la "{{{{Session.WorkingDirectory}}}}" >&2 || true
+    exit 3
+fi
+
+echo "Resolved VRScene to: $VRSCENE_PATH"
+SCENE_DIR="$(cd "$(dirname "$VRSCENE_PATH")" && pwd)"
+echo "Changing directory to scene root: $SCENE_DIR"
+cd "$SCENE_DIR"
+{ocio_block}
+echo "Executing V-Ray Standalone..."
+exec vray -sceneFile="$(basename "$VRSCENE_PATH")" -frames={{{{Task.Param.Frame}}}} -display=0 -showProgress=2
+"""
+            step["stepEnvironments"] = [
+                {
+                    "name": "V-Ray Standalone",
+                    "description": "Runs V-Ray Standalone without Maya.",
+                    "variables": {"VRAY_RENDERER": "vray"},
+                }
+            ]
+            step["script"] = {
+                "embeddedFiles": [
+                    {
+                        "name": "runScript",
+                        "filename": "run_vray.sh",
+                        "type": "TEXT",
+                        "data": vray_script,
+                    }
+                ],
+                "actions": {
+                    "onRun": {
+                        "command": "bash",
+                        "args": [
+                            "{{Task.File.runScript}}",
+                        ],
+                        "cancelation": {"mode": "NOTIFY_THEN_TERMINATE"},
+                    }
+                },
+            }
+            continue
         # If we're submitting all cameras, create another parameter space dimension
         if settings.camera_selection == ALL_CAMERAS:
             parameter_space["taskParameterDefinitions"].append(
@@ -355,6 +486,16 @@ def _get_parameter_values(
     else:
         parameter_values.append(
             {"name": "OutputFilePrefix", "value": render_layers[0].output_file_prefix}
+        )
+
+    for layer_data in render_layers:
+        if layer_data.renderer_name != "vray":
+            continue
+        parameter_values.append(
+            {
+                "name": _vrscene_parameter_name(layer_data),
+                "value": vrscene_path(settings.output_path, layer_data.display_name).as_posix(),
+            }
         )
 
     if render_layers[0].image_width_parameter_name:
@@ -648,6 +789,11 @@ def _prepare_render_layers_for_submission(
             layer_data.image_height_parameter_name = f"{layer_data.display_name}ImageHeight"
 
     renderers = get_submit_renderers(settings.render_layer_selection == LayerSelection.CURRENT)
+    if "vray" in renderers and len(renderers) > 1:
+        raise DeadlineOperationError(
+            "V-Ray Standalone submissions cannot be mixed with Maya renderers. "
+            "Submit V-Ray layers separately."
+        )
 
     return (
         submit_render_layers,
@@ -849,6 +995,23 @@ def on_create_job_bundle_callback(
         if button == "Yes":
             maya.cmds.file(save=True)
 
+    selected_layers = get_submit_render_layers(
+        settings.render_layer_selection == LayerSelection.CURRENT
+    )
+    exported_vrscenes: list[str] = []
+    exported_vrscene_assets: set[str] = set()
+    exported_vrscene_directories: set[str] = set()
+    for layer_data in selected_layers:
+        if layer_data.renderer_name != "vray":
+            continue
+        scene_path = vrscene_path(settings.output_path, layer_data.display_name)
+        camera_name = layer_data.renderable_camera_names[0]
+        exported_vrscenes.append(
+            export_vrscene(scene_path, layer_data.name, camera_name).as_posix()
+        )
+        exported_vrscene_assets.update(vrscene_asset_paths(scene_path))
+        exported_vrscene_directories.add(scene_path.parent.as_posix())
+
     job_bundle_path = Path(job_bundle_dir)
 
     # Get job bundle content using the extracted functions
@@ -856,6 +1019,16 @@ def on_create_job_bundle_callback(
     parameter_values = get_parameter_values_for_submission(
         settings, cast(list[dict[str, Any]], queue_parameters)
     )
+    attachments: AssetReferences = widget.job_attachments.attachments
+    attachments.input_filenames.update(exported_vrscenes)
+    attachments.input_filenames.update(exported_vrscene_assets)
+    attachments.input_directories.update(exported_vrscene_directories)
+    ocio_config = Scene.ocio_config_file()
+    if ocio_config and os.path.isfile(ocio_config):
+        attachments.input_filenames.add(os.path.normpath(ocio_config))
+    asset_references.input_filenames.update(attachments.input_filenames)
+    asset_references.input_directories.update(attachments.input_directories)
+    asset_references.output_directories.update(attachments.output_directories)
     asset_references_dict = get_asset_references_for_submission(asset_references)
 
     with open(job_bundle_path / "template.yaml", "w", encoding="utf8") as f:
@@ -868,7 +1041,6 @@ def on_create_job_bundle_callback(
         deadline_yaml_dump(asset_references_dict, f, indent=1)
 
     # Save Sticky Settings
-    attachments: AssetReferences = widget.job_attachments.attachments
     settings.input_filenames = sorted(attachments.input_filenames)
     settings.input_directories = sorted(attachments.input_directories)
     settings.input_filenames = sorted(attachments.input_filenames)
@@ -910,6 +1082,24 @@ def show_maya_render_submitter(
     render_layers: list[RenderLayerData] = _set_render_layer_data()
     print(f"Render layers processed at {time.time()}")
     all_renderers: set[str] = {layer_data.renderer_name for layer_data in render_layers}
+    only_vray = all_renderers == {"vray"}
+    exported_vrscenes: list[str] = []
+    selected_layers = get_submit_render_layers(
+        render_settings.render_layer_selection == LayerSelection.CURRENT
+    )
+    for layer_data in selected_layers:
+        if layer_data.renderer_name != "vray":
+            continue
+        scene_path = vrscene_path(
+            render_settings.output_path, layer_data.display_name
+        )
+        exported_vrscenes.append(
+            export_vrscene(
+                scene_path,
+                layer_data.name,
+                layer_data.renderable_camera_names[0],
+            ).as_posix()
+        )
 
     auto_detected_attachments = AssetReferences()
     introspector = AssetIntrospector()
@@ -942,8 +1132,18 @@ def show_maya_render_submitter(
             update_progress(f"Processed {i+1}/{total_assets} assets")
 
     progress_dialog.setValue(total_assets)
+    if only_vray:
+        processed_files.discard(os.path.normpath(Scene.name()))
     auto_detected_attachments.input_filenames = processed_files
     auto_detected_attachments.input_directories = processed_directories
+    auto_detected_attachments.input_filenames.update(exported_vrscenes)
+    for vrscene in exported_vrscenes:
+        auto_detected_attachments.input_filenames.update(
+            vrscene_referenced_asset_paths(Path(vrscene))
+        )
+        auto_detected_attachments.input_filenames.update(
+            vrscene_asset_paths(Path(vrscene))
+        )
     print(f"All {total_assets} assets processed at {time.time()}")
     update_progress(f"All {total_assets} assets processed")
 
@@ -957,14 +1157,37 @@ def show_maya_render_submitter(
         input_directories=set(render_settings.input_directories),
         output_directories=set(render_settings.output_directories),
     )
+    if only_vray:
+        attachments.input_filenames.discard(os.path.normpath(Scene.name()))
+        asset_references.input_filenames.discard(os.path.normpath(Scene.name()))
+    asset_references.input_filenames.update(exported_vrscenes)
+    attachments.input_filenames.update(exported_vrscenes)
+    for vrscene in exported_vrscenes:
+        vrscene_path_obj = Path(vrscene)
+        vrscene_referenced_assets = vrscene_referenced_asset_paths(
+            vrscene_path_obj
+        )
+        vrscene_assets = vrscene_asset_paths(vrscene_path_obj)
+        asset_references.input_filenames.update(vrscene_referenced_assets)
+        attachments.input_filenames.update(vrscene_referenced_assets)
+        asset_references.input_filenames.update(vrscene_assets)
+        attachments.input_filenames.update(vrscene_assets)
+        attachments.input_directories.add(vrscene_path_obj.parent.as_posix())
+    ocio_config = Scene.ocio_config_file()
+    if ocio_config and os.path.isfile(ocio_config):
+        attachments.input_filenames.add(os.path.normpath(ocio_config))
+        asset_references.input_filenames.add(os.path.normpath(ocio_config))
 
     update_progress("Preparing submission parameters...")
     maya_version = maya.cmds.about(version=True)
-    adaptor_version = ".".join(str(v) for v in adaptor_version_tuple[:2])
-    # Need Maya and the Maya OpenJD application interface adaptor
-    rez_packages = f"mayaIO-{maya_version} deadline_cloud_for_maya"
-    # conda_packages = f"maya={maya_version}.* maya-openjd={adaptor_version}.*"
-    conda_packages = f"maya={maya_version}.* maya-openjd"
+    if only_vray:
+        rez_packages = ""
+        # Service-managed fleets provide V-Ray Standalone through this package.
+        # For a customer-managed fleet this field can be cleared in the dialog.
+        conda_packages = "vray-standalone=7.40.09"
+    else:
+        rez_packages = f"mayaIO-{maya_version} deadline_cloud_for_maya"
+        conda_packages = f"maya={maya_version}.* maya-openjd"
     # Initialize telemetry client, opt-out is respected
     get_deadline_cloud_library_telemetry_client().update_common_details(
         {
@@ -976,7 +1199,7 @@ def show_maya_render_submitter(
     if "arnold" in all_renderers:
         rez_packages += " mtoa"
         conda_packages += " maya-mtoa"
-    if "vray" in all_renderers:
+    if "vray" in all_renderers and not only_vray:
         conda_packages += " maya-vray"
     if "redshift" in all_renderers:
         conda_packages += " maya-redshift"

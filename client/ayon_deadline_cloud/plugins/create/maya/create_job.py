@@ -10,6 +10,7 @@ from ayon_core.lib import (
     NumberDef,
     TextDef,
 )
+from ayon_core.settings import get_project_settings
 from ayon_maya.api import plugin
 from deadline.maya_submitter.scene import Scene
 from maya import cmds
@@ -91,7 +92,14 @@ class CreateDeadlineCloudJob(plugin.MayaCreator):
             settings.project_path = Scene.project_path() or work_dir
             settings.output_path = Scene.output_path() or work_dir
 
-        queue_parameters: list[dict[str, Any]] = get_queue_parameters()
+        project_name = self.create_context.get_current_project_name()
+        addon_settings = get_project_settings(project_name).get(
+            "deadline_cloud", {}
+        )
+        queue_parameters: list[dict[str, Any]] = get_queue_parameters(
+            farm_id=addon_settings.get("farm_id"),
+            queue_id=addon_settings.get("queue_id"),
+        )
 
         # this would be 'job_bundle/template.yaml'
         job_template = get_job_template_for_submission(settings)
