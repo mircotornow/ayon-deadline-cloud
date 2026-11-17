@@ -141,17 +141,16 @@ class CollectDeadlineCloudJobData(
         # update AssetReferences object
         asset_references = AssetReferences.from_dict(asset_refs_dict)
 
-        if instance.context.data.get("hostName") == "maya":
-            from deadline.maya_submitter.vray_export import sanitize_output_path
+        if (
+            instance.context.data.get("hostName") == "maya"
+            and not settings.output_path
+        ):
+            from deadline.maya_submitter.scene import Scene
 
-            if not settings.output_path:
-                from deadline.maya_submitter.scene import Scene
-
-                settings.output_path = (
-                    self._resolve_output_path(asset_references.output_directories)
-                    or Scene.output_path()
-                )
-            settings.output_path = sanitize_output_path(settings.output_path).as_posix()
+            settings.output_path = (
+                self._resolve_output_path(asset_references.output_directories)
+                or Scene.output_path()
+            )
 
         attr_values = self.get_attr_values_from_data(instance.data)
 
@@ -454,12 +453,6 @@ class CollectDeadlineCloudJobData(
                 if not isinstance(attr_value, bool)
                 else str(attr_value).lower()
             )
-            # If on macOS/Linux and path is a Windows path from a colleague, sanitize it
-            if attr_name in ("OutputFilePath", "ProjectPath") and os.name != "nt":
-                import re
-                if re.match(r"^[a-zA-Z]:", str_value):
-                    from deadline.maya_submitter.vray_export import sanitize_output_path
-                    str_value = sanitize_output_path(str_value).as_posix()
             # attribute is already in parameter_values
             if attr_name in pv_by_name:
                 pv_by_name[attr_name]["value"] = str_value

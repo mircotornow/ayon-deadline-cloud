@@ -42,7 +42,6 @@ from .render_layers import (
 )
 from .vray_export import (
     export_vrscene,
-    sanitize_output_path,
     vrscene_asset_paths,
     vrscene_path,
     vrscene_referenced_asset_paths,
@@ -247,83 +246,6 @@ def _get_job_template(
             )
 
         if layer_data.renderer_name == "vray":
-            safe_layer_name = "".join(
-                character if character.isalnum() or character in "._-" else "_"
-                for character in layer_data.display_name
-            )
-            vrscene_file_name = f"{safe_layer_name}.vrscene"
-            vrscene_param_name = _vrscene_parameter_name(layer_data)
-
-            has_ocio = any(
-                param.get("name") == "OCIOConfigFile"
-                for param in job_template.get("parameterDefinitions", [])
-            )
-            ocio_block = ""
-            if has_ocio:
-                ocio_block = """
-# Configure Color Management (OCIO) if provided
-OCIO_PARAM="{{Param.OCIOConfigFile}}"
-if [ -n "$OCIO_PARAM" ] && [ -f "$OCIO_PARAM" ]; then
-    export OCIO="$OCIO_PARAM"
-    echo "Using OCIO config: $OCIO"
-elif [ -n "$OCIO_PARAM" ]; then
-    OCIO_NAME="$(basename "$OCIO_PARAM")"
-    FOUND_OCIO="$(find "{{Session.WorkingDirectory}}" -name "$OCIO_NAME" 2>/dev/null | head -n 1 || true)"
-    if [ -n "$FOUND_OCIO" ] && [ -f "$FOUND_OCIO" ]; then
-        export OCIO="$FOUND_OCIO"
-        echo "Found staged OCIO config: $OCIO"
-    fi
-fi
-"""
-
-            vray_script = f"""#!/bin/bash
-set -euo pipefail
-
-echo "=============================================="
-echo "Starting V-Ray Standalone Task"
-echo "=============================================="
-
-# 1. Resolve VRScene file path
-VRSCENE_NAME="{vrscene_file_name}"
-VRSCENE_PATH="{{{{Param.{vrscene_param_name}}}}}"
-
-if [ ! -f "$VRSCENE_PATH" ]; then
-    echo "VRScene not found at parameter path: $VRSCENE_PATH"
-    echo "Searching in session directory: {{{{Session.WorkingDirectory}}}} ..."
-    FOUND="$(find "{{{{Session.WorkingDirectory}}}}" -name "$VRSCENE_NAME" 2>/dev/null | head -n 1 || true)"
-    if [ -n "$FOUND" ] && [ -f "$FOUND" ]; then
-        VRSCENE_PATH="$FOUND"
-    else
-        echo "Searching across /sessions ..."
-        FOUND="$(find /sessions -name "$VRSCENE_NAME" 2>/dev/null | head -n 1 || true)"
-        if [ -n "$FOUND" ] && [ -f "$FOUND" ]; then
-            VRSCENE_PATH="$FOUND"
-        else
-            echo "Searching in /tmp ..."
-            FOUND="$(find /tmp -name "$VRSCENE_NAME" 2>/dev/null | head -n 1 || true)"
-            if [ -n "$FOUND" ] && [ -f "$FOUND" ]; then
-                VRSCENE_PATH="$FOUND"
-            fi
-        fi
-    fi
-fi
-
-if [ -z "$VRSCENE_PATH" ] || [ ! -f "$VRSCENE_PATH" ]; then
-    echo "ERROR: Could not locate $VRSCENE_NAME in session or system paths!" >&2
-    echo "Current working directory: $(pwd)" >&2
-    echo "Contents of session directory:" >&2
-    ls -la "{{{{Session.WorkingDirectory}}}}" >&2 || true
-    exit 3
-fi
-
-echo "Resolved VRScene to: $VRSCENE_PATH"
-SCENE_DIR="$(cd "$(dirname "$VRSCENE_PATH")" && pwd)"
-echo "Changing directory to scene root: $SCENE_DIR"
-cd "$SCENE_DIR"
-{ocio_block}
-echo "Executing V-Ray Standalone..."
-exec vray -sceneFile="$(basename "$VRSCENE_PATH")" -frames={{{{Task.Param.Frame}}}} -display=0 -showProgress=2
-"""
             step["stepEnvironments"] = [
                 {
                     "name": "V-Ray Standalone",
@@ -332,23 +254,18 @@ exec vray -sceneFile="$(basename "$VRSCENE_PATH")" -frames={{{{Task.Param.Frame}
                 }
             ]
             step["script"] = {
-                "embeddedFiles": [
-                    {
-                        "name": "runScript",
-                        "filename": "run_vray.sh",
-                        "type": "TEXT",
-                        "data": vray_script,
-                    }
-                ],
                 "actions": {
                     "onRun": {
-                        "command": "bash",
+                        "command": "vray",
                         "args": [
-                            "{{Task.File.runScript}}",
+                            f"-sceneFile={{{{Param.{_vrscene_parameter_name(layer_data)}}}}}",
+                            "-frames={{Task.Param.Frame}}",
+                            "-display=0",
+                            "-showProgress=2",
                         ],
                         "cancelation": {"mode": "NOTIFY_THEN_TERMINATE"},
                     }
-                },
+                }
             }
             continue
         # If we're submitting all cameras, create another parameter space dimension
@@ -489,15 +406,13 @@ def _get_parameter_values(
             {"name": "OutputFilePrefix", "value": render_layers[0].output_file_prefix}
         )
 
-    sanitized_output_path = sanitize_output_path(settings.output_path).as_posix()
-
     for layer_data in render_layers:
         if layer_data.renderer_name != "vray":
             continue
         parameter_values.append(
             {
                 "name": _vrscene_parameter_name(layer_data),
-                "value": vrscene_path(sanitized_output_path, layer_data.display_name).as_posix(),
+                "value": vrscene_path(settings.output_path, layer_data.display_name).as_posix(),
             }
         )
 
@@ -534,7 +449,7 @@ def _get_parameter_values(
         parameter_values.append({"name": "Camera", "value": settings.camera_selection})
 
     parameter_values.append({"name": "ProjectPath", "value": settings.project_path})
-    parameter_values.append({"name": "OutputFilePath", "value": sanitized_output_path})
+    parameter_values.append({"name": "OutputFilePath", "value": settings.output_path})
     parameter_values.append(
         {
             "name": "RenderSetupIncludeLights",
