@@ -42,6 +42,7 @@ from .render_layers import (
 )
 from .vray_export import (
     export_vrscene,
+    sanitize_output_path,
     vrscene_asset_paths,
     vrscene_path,
     vrscene_referenced_asset_paths,
@@ -488,13 +489,15 @@ def _get_parameter_values(
             {"name": "OutputFilePrefix", "value": render_layers[0].output_file_prefix}
         )
 
+    sanitized_output_path = sanitize_output_path(settings.output_path).as_posix()
+
     for layer_data in render_layers:
         if layer_data.renderer_name != "vray":
             continue
         parameter_values.append(
             {
                 "name": _vrscene_parameter_name(layer_data),
-                "value": vrscene_path(settings.output_path, layer_data.display_name).as_posix(),
+                "value": vrscene_path(sanitized_output_path, layer_data.display_name).as_posix(),
             }
         )
 
@@ -531,7 +534,7 @@ def _get_parameter_values(
         parameter_values.append({"name": "Camera", "value": settings.camera_selection})
 
     parameter_values.append({"name": "ProjectPath", "value": settings.project_path})
-    parameter_values.append({"name": "OutputFilePath", "value": settings.output_path})
+    parameter_values.append({"name": "OutputFilePath", "value": sanitized_output_path})
     parameter_values.append(
         {
             "name": "RenderSetupIncludeLights",

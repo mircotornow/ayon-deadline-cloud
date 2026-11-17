@@ -36,8 +36,45 @@ def _make_home_paths_relative(scene_path: Path) -> None:
     scene_path.write_text(contents, encoding="utf-8", errors="surrogateescape")
 
 
+def sanitize_output_path(output_path: str | Path | None) -> Path:
+    """Sanitize a path that might have originated from Windows (e.g. D:/) when running on macOS/Linux."""
+    if not output_path:
+        output_path_str = ""
+    else:
+        output_path_str = str(output_path).strip()
+
+    if os.name != "nt" and re.match(r"^[a-zA-Z]:", output_path_str):
+        current_scene = ""
+        try:
+            if maya.cmds:
+                current_scene = maya.cmds.file(query=True, sceneName=True) or ""
+        except Exception:
+            pass
+
+        if not current_scene:
+            current_scene = os.environ.get("AYON_WORKDIR", "")
+
+        # Try to match the relative project structure (e.g. /scenes/sq0080/sh0240/...)
+        match = re.search(r"[/\\](scenes[/\\].*)$", output_path_str, re.IGNORECASE)
+        if match and current_scene:
+            rel_part = match.group(1).replace("\\", "/")
+            scene_match = re.search(r"^(.*?)[/\\]scenes[/\\]", current_scene, re.IGNORECASE)
+            if scene_match:
+                base = scene_match.group(1)
+                return (Path(base) / rel_part).resolve()
+
+        if current_scene:
+            scene_dir = Path(current_scene).parent
+            if scene_dir.name.lower() in ("maya", "scenes", "work"):
+                return (scene_dir.parent / "renders").resolve()
+            return (scene_dir / "renders").resolve()
+
+    return Path(output_path_str).resolve()
+
+
 def vrscene_path(output_path: str, layer_name: str) -> Path:
     """Return the deterministic local path used for a layer's vrscene."""
+    output_path_obj = sanitize_output_path(output_path)
     safe_layer_name = "".join(
         character if character.isalnum() or character in "._-" else "_"
         for character in layer_name
@@ -45,7 +82,7 @@ def vrscene_path(output_path: str, layer_name: str) -> Path:
     # Keep exported scenes outside the render output root so the publish
     # collector only discovers rendered images.
     return (
-        Path(output_path).parent
+        output_path_obj.parent
         / ".ayon"
         / "deadline_cloud"
         / f"{safe_layer_name}.vrscene"
