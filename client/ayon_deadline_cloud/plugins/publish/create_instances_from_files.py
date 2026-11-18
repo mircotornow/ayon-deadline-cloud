@@ -298,10 +298,14 @@ class CreateInstancesFromFiles(pyblish.api.ContextPlugin):
 
         """
         files = [Path(f).name for f in col]
+        # AYON's IntegrateAsset validates list-valued `files` as multi-frame
+        # sequences requiring at least 2 frames; single-frame outputs must be
+        # passed as a plain filename string.
+        repre_files: str | list[str] = files[0] if len(files) == 1 else files
         return StandardRepresentation(
             name=name,
             ext=col.tail.lstrip("."),
-            files=files,
+            files=repre_files,
             stagingDir=staging_dir.as_posix(),
             tags=["review"],
             frameStart=min(col.indexes),
