@@ -586,12 +586,34 @@ class CreateInstancesFromFiles(pyblish.api.ContextPlugin):
                 msg = f"Provided path {path} has no files."
                 raise KnownPublishError(msg)
 
-            cols: list[clique.Collection]
-            rems: list[str]
-            cols, rems = clique.assemble(
-                [f.as_posix() for f in files],
-                minimum_items=1,
-            )
+            files_by_dir: dict[Path, list[Path]] = {}
+            for file_path in files:
+                files_by_dir.setdefault(file_path.parent, []).append(file_path)
+
+            cols = []
+            rems = []
+            # Only match frame numbers right before the file extension in
+            # basenames so digits in parent directory names (like sq0080,
+            # sh0240, assetroot-..., v001) are never parsed as sequences.
+            frame_pattern = r"[._-](?P<index>(?P<padding>0*)\d+)\.[^.]+$"
+            for parent_dir, dir_files in sorted(files_by_dir.items()):
+                dir_cols, dir_rems = clique.assemble(
+                    [f.name for f in dir_files],
+                    patterns=[frame_pattern],
+                    minimum_items=1,
+                )
+                prefix = f"{parent_dir.as_posix().rstrip('/')}/"
+                for col in dir_cols:
+                    cols.append(
+                        clique.Collection(
+                            head=f"{prefix}{col.head}",
+                            tail=col.tail,
+                            padding=col.padding,
+                            indexes=col.indexes,
+                        )
+                    )
+                for rem in dir_rems:
+                    rems.append(f"{prefix}{rem}")
 
         instances: list[InstanceData] = []
 
