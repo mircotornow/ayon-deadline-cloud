@@ -246,6 +246,133 @@ def _get_job_template(
             )
 
         if layer_data.renderer_name == "vray":
+            vrscene_param_name = _vrscene_parameter_name(layer_data)
+            vray_script = """#!/bin/bash
+set -euo pipefail
+
+echo "=============================================="
+echo "Starting V-Ray Standalone Task"
+echo "=============================================="
+
+VRSCENE_PATH="{{Param.__VRSCENE_PARAM__}}"
+echo "Configured VRScene path: $VRSCENE_PATH"
+
+if [ ! -f "$VRSCENE_PATH" ]; then
+    VRSCENE_NAME="$(basename "$VRSCENE_PATH")"
+    echo "VRScene not found at parameter path, searching in session directory..."
+    FOUND="$(find "{{Session.WorkingDirectory}}" /sessions -name "$VRSCENE_NAME" 2>/dev/null | head -n 1 || true)"
+    if [ -n "$FOUND" ] && [ -f "$FOUND" ]; then
+        VRSCENE_PATH="$FOUND"
+        echo "Found VRScene at: $VRSCENE_PATH"
+    fi
+fi
+
+if [ -z "$VRSCENE_PATH" ] || [ ! -f "$VRSCENE_PATH" ]; then
+    echo "ERROR: Could not locate VRScene file!" >&2
+    exit 3
+fi
+
+REMAP_FILE="{{Session.WorkingDirectory}}/vray_remap.xml"
+export MAPPING_FILE="{{Session.PathMappingRulesFile}}"
+export VRSCENE_PATH="$VRSCENE_PATH"
+export REMAP_OUTPUT="$REMAP_FILE"
+
+# 1. Process path mapping rules: generate V-Ray remap XML and patch .vrscene in-place
+python3 - << 'PY_EOF'
+import json, os, re
+import xml.etree.ElementTree as ET
+
+mapping_file = os.environ.get("MAPPING_FILE", "")
+vrscene = os.environ.get("VRSCENE_PATH", "")
+remap_out = os.environ.get("REMAP_OUTPUT", "")
+
+rules = []
+if mapping_file and os.path.exists(mapping_file):
+    try:
+        with open(mapping_file, "r", encoding="utf-8", errors="surrogateescape") as f:
+            rules = json.load(f).get("path_mapping_rules", [])
+    except Exception as e:
+        print(f"Warning: could not read path mapping rules: {e}")
+
+print(f"Loaded {len(rules)} path mapping rules.")
+
+root = ET.Element("RemapPaths")
+norm_rules = []
+for r in sorted(rules, key=lambda x: len(x.get("source_path", "")), reverse=True):
+    src = r.get("source_path", "").strip()
+    dst = r.get("destination_path", "").strip()
+    if not src or not dst:
+        continue
+    s_norm = src.replace("\\", "/").rstrip("/")
+    d_norm = dst.replace("\\", "/").rstrip("/")
+    norm_rules.append((s_norm.lower(), s_norm, d_norm))
+    variants = set()
+    variants.add(src)
+    variants.add(src.replace("\\", "/"))
+    variants.add(src.replace("/", "\\"))
+    for v in variants:
+        item = ET.SubElement(root, "RemapItem")
+        ET.SubElement(item, "From").text = v
+        ET.SubElement(item, "To").text = dst
+
+if remap_out:
+    ET.ElementTree(root).write(remap_out, encoding="utf-8", xml_declaration=True)
+    print(f"Generated V-Ray remap XML at: {remap_out}")
+
+if vrscene and os.path.exists(vrscene) and norm_rules:
+    try:
+        with open(vrscene, "r", encoding="utf-8", errors="surrogateescape") as f:
+            content = f.read()
+
+        def repl(m):
+            raw = m.group(1)
+            raw_norm = raw.replace("\\", "/")
+            raw_lower = raw_norm.lower()
+            for s_lower, _, d in norm_rules:
+                if raw_lower.startswith(s_lower):
+                    return f'"{d}{raw_norm[len(s_lower):]}"'
+            return m.group(0)
+
+        patched = re.sub(r'"([^"\r\n]+)"', repl, content)
+        with open(vrscene, "w", encoding="utf-8", errors="surrogateescape") as f:
+            f.write(patched)
+        print("Successfully patched VRScene with local worker paths.")
+    except Exception as e:
+        print(f"Warning: failed to patch VRScene: {e}")
+PY_EOF
+
+# 2. Export OCIO config path
+OCIO_PARAM="{{Param.OCIOConfigFile}}"
+if [ -n "$OCIO_PARAM" ] && [ -f "$OCIO_PARAM" ]; then
+    export OCIO="$OCIO_PARAM"
+    echo "Using OCIO from parameter: $OCIO"
+elif [ -z "${OCIO:-}" ] || [ ! -f "$OCIO" ]; then
+    FOUND_OCIO="$(find "{{Session.WorkingDirectory}}" /sessions -name "*.ocio" 2>/dev/null | head -n 1 || true)"
+    if [ -n "$FOUND_OCIO" ] && [ -f "$FOUND_OCIO" ]; then
+        export OCIO="$FOUND_OCIO"
+        echo "Found staged OCIO config: $OCIO"
+    fi
+fi
+
+export VRAY_PATH_REMAPPING_CASE_SENSITIVE=0
+SCENE_DIR="$(cd "$(dirname "$VRSCENE_PATH")" && pwd)"
+export VRAY_ASSETS_PATH="${VRAY_ASSETS_PATH:-}:$SCENE_DIR:{{Session.WorkingDirectory}}"
+
+REMAP_ARGS=()
+if [ -f "$REMAP_FILE" ] && grep -q "<RemapItem>" "$REMAP_FILE"; then
+    export VRAY_PATH_REMAP_FILEPATH="$REMAP_FILE"
+    REMAP_ARGS=("-remapPathFile=$REMAP_FILE")
+fi
+
+cd "$SCENE_DIR"
+echo "Executing V-Ray Standalone..."
+exec vray \
+    -sceneFile="$VRSCENE_PATH" \
+    -frames={{Task.Param.Frame}} \
+    "${REMAP_ARGS[@]}" \
+    -display=0 \
+    -showProgress=2
+""".replace("__VRSCENE_PARAM__", vrscene_param_name)
             step["stepEnvironments"] = [
                 {
                     "name": "V-Ray Standalone",
@@ -254,18 +381,23 @@ def _get_job_template(
                 }
             ]
             step["script"] = {
+                "embeddedFiles": [
+                    {
+                        "name": "runScript",
+                        "filename": "run_vray.sh",
+                        "type": "TEXT",
+                        "data": vray_script,
+                    }
+                ],
                 "actions": {
                     "onRun": {
-                        "command": "vray",
+                        "command": "bash",
                         "args": [
-                            f"-sceneFile={{{{Param.{_vrscene_parameter_name(layer_data)}}}}}",
-                            "-frames={{Task.Param.Frame}}",
-                            "-display=0",
-                            "-showProgress=2",
+                            "{{Task.File.runScript}}",
                         ],
                         "cancelation": {"mode": "NOTIFY_THEN_TERMINATE"},
                     }
-                }
+                },
             }
             continue
         # If we're submitting all cameras, create another parameter space dimension
