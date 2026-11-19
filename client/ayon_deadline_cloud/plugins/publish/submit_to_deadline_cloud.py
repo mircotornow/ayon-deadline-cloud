@@ -104,6 +104,10 @@ class SubmitToDeadlineCloud(pyblish.api.InstancePlugin):
                     lambda _msg, _default: True
                 )
 
+            render_settings = submitter_settings.get("render_settings", {})
+            max_retries = render_settings.get("max_retries_per_task", 1)
+            kwargs["max_retries_per_task"] = max_retries
+
             job_id = create_job_from_job_bundle(**kwargs)
             self.log.info(
                 "Job submitted to AWS Deadline Cloud with ID: %s",

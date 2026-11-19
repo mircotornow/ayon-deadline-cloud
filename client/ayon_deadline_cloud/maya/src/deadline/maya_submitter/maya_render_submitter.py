@@ -247,6 +247,73 @@ def _get_job_template(
 
         if layer_data.renderer_name == "vray":
             vrscene_param_name = _vrscene_parameter_name(layer_data)
+            remap_python_script = """import json
+import os
+import re
+import xml.etree.ElementTree as ET
+
+BS = chr(92)
+mapping_file = os.environ.get("MAPPING_FILE", "")
+vrscene = os.environ.get("VRSCENE_PATH", "")
+remap_out = os.environ.get("REMAP_OUTPUT", "")
+
+rules = []
+if mapping_file and os.path.exists(mapping_file):
+    try:
+        with open(mapping_file, "r", encoding="utf-8", errors="surrogateescape") as f:
+            rules = json.load(f).get("path_mapping_rules", [])
+    except Exception as e:
+        print(f"Warning: could not read path mapping rules: {e}")
+
+print(f"Loaded {len(rules)} path mapping rules.")
+
+root = ET.Element("RemapPaths")
+norm_rules = []
+for r in sorted(rules, key=lambda x: len(x.get("source_path", "")), reverse=True):
+    src = r.get("source_path", "").strip()
+    dst = r.get("destination_path", "").strip()
+    if not src or not dst:
+        continue
+    s_norm = src.replace(BS, "/").rstrip("/")
+    d_norm = dst.replace(BS, "/").rstrip("/")
+    norm_rules.append((s_norm.lower(), s_norm, d_norm))
+    variants = set()
+    variants.add(src)
+    variants.add(src.replace(BS, "/"))
+    variants.add(src.replace("/", BS))
+    for v in variants:
+        item = ET.SubElement(root, "RemapItem")
+        ET.SubElement(item, "From").text = v
+        ET.SubElement(item, "To").text = dst
+
+if remap_out:
+    ET.ElementTree(root).write(remap_out, encoding="utf-8", xml_declaration=True)
+    print(f"Generated V-Ray remap XML at: {remap_out}")
+
+if vrscene and os.path.exists(vrscene) and norm_rules:
+    try:
+        with open(vrscene, "r", encoding="utf-8", errors="surrogateescape") as f:
+            content = f.read()
+
+        def repl(m):
+            raw = m.group(1)
+            if chr(10) in raw or chr(13) in raw:
+                return m.group(0)
+            raw_norm = raw.replace(BS, "/")
+            raw_lower = raw_norm.lower()
+            for s_lower, _, d in norm_rules:
+                if raw_lower.startswith(s_lower):
+                    return chr(34) + d + raw_norm[len(s_lower):] + chr(34)
+            return m.group(0)
+
+        patched = re.sub(r'"([^"]+)"', repl, content)
+        with open(vrscene, "w", encoding="utf-8", errors="surrogateescape") as f:
+            f.write(patched)
+        print("Successfully patched VRScene with local worker paths.")
+    except Exception as e:
+        print(f"Warning: failed to patch VRScene: {e}")
+"""
+
             vray_script = """#!/bin/bash
 set -euo pipefail
 
@@ -278,68 +345,7 @@ export VRSCENE_PATH="$VRSCENE_PATH"
 export REMAP_OUTPUT="$REMAP_FILE"
 
 # 1. Process path mapping rules: generate V-Ray remap XML and patch .vrscene in-place
-python3 - << 'PY_EOF'
-import json, os, re
-import xml.etree.ElementTree as ET
-
-mapping_file = os.environ.get("MAPPING_FILE", "")
-vrscene = os.environ.get("VRSCENE_PATH", "")
-remap_out = os.environ.get("REMAP_OUTPUT", "")
-
-rules = []
-if mapping_file and os.path.exists(mapping_file):
-    try:
-        with open(mapping_file, "r", encoding="utf-8", errors="surrogateescape") as f:
-            rules = json.load(f).get("path_mapping_rules", [])
-    except Exception as e:
-        print(f"Warning: could not read path mapping rules: {e}")
-
-print(f"Loaded {len(rules)} path mapping rules.")
-
-root = ET.Element("RemapPaths")
-norm_rules = []
-for r in sorted(rules, key=lambda x: len(x.get("source_path", "")), reverse=True):
-    src = r.get("source_path", "").strip()
-    dst = r.get("destination_path", "").strip()
-    if not src or not dst:
-        continue
-    s_norm = src.replace("\\", "/").rstrip("/")
-    d_norm = dst.replace("\\", "/").rstrip("/")
-    norm_rules.append((s_norm.lower(), s_norm, d_norm))
-    variants = set()
-    variants.add(src)
-    variants.add(src.replace("\\", "/"))
-    variants.add(src.replace("/", "\\"))
-    for v in variants:
-        item = ET.SubElement(root, "RemapItem")
-        ET.SubElement(item, "From").text = v
-        ET.SubElement(item, "To").text = dst
-
-if remap_out:
-    ET.ElementTree(root).write(remap_out, encoding="utf-8", xml_declaration=True)
-    print(f"Generated V-Ray remap XML at: {remap_out}")
-
-if vrscene and os.path.exists(vrscene) and norm_rules:
-    try:
-        with open(vrscene, "r", encoding="utf-8", errors="surrogateescape") as f:
-            content = f.read()
-
-        def repl(m):
-            raw = m.group(1)
-            raw_norm = raw.replace("\\", "/")
-            raw_lower = raw_norm.lower()
-            for s_lower, _, d in norm_rules:
-                if raw_lower.startswith(s_lower):
-                    return f'"{d}{raw_norm[len(s_lower):]}"'
-            return m.group(0)
-
-        patched = re.sub(r'"([^"\r\n]+)"', repl, content)
-        with open(vrscene, "w", encoding="utf-8", errors="surrogateescape") as f:
-            f.write(patched)
-        print("Successfully patched VRScene with local worker paths.")
-    except Exception as e:
-        print(f"Warning: failed to patch VRScene: {e}")
-PY_EOF
+python3 "{{Task.File.remapScript}}"
 
 # 2. Export OCIO config path
 OCIO_PARAM="{{Param.OCIOConfigFile}}"
@@ -362,6 +368,15 @@ REMAP_ARGS=()
 if [ -f "$REMAP_FILE" ] && grep -q "<RemapItem>" "$REMAP_FILE"; then
     export VRAY_PATH_REMAP_FILEPATH="$REMAP_FILE"
     REMAP_ARGS=("-remapPathFile=$REMAP_FILE")
+fi
+
+if ! command -v vray &>/dev/null; then
+    echo "vray not found in PATH, searching in system and conda directories..."
+    FOUND_VRAY="$(find /home/job-user/conda-envs /opt /usr/local -name "vray" -type f -perm /111 2>/dev/null | head -n 1 || true)"
+    if [ -n "$FOUND_VRAY" ] && [ -x "$FOUND_VRAY" ]; then
+        echo "Found vray at: $FOUND_VRAY"
+        export PATH="$(dirname "$FOUND_VRAY"):$PATH"
+    fi
 fi
 
 cd "$SCENE_DIR"
@@ -387,7 +402,13 @@ exec vray \
                         "filename": "run_vray.sh",
                         "type": "TEXT",
                         "data": vray_script,
-                    }
+                    },
+                    {
+                        "name": "remapScript",
+                        "filename": "remap_vray.py",
+                        "type": "TEXT",
+                        "data": remap_python_script,
+                    },
                 ],
                 "actions": {
                     "onRun": {
@@ -1060,6 +1081,7 @@ def on_create_job_bundle_callback(
             export_vrscene(scene_path, layer_data.name, camera_name).as_posix()
         )
         exported_vrscene_assets.update(vrscene_asset_paths(scene_path))
+        exported_vrscene_assets.update(vrscene_referenced_asset_paths(scene_path))
         exported_vrscene_directories.add(scene_path.parent.as_posix())
 
     job_bundle_path = Path(job_bundle_dir)

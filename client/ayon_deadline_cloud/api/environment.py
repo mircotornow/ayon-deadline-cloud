@@ -33,11 +33,20 @@ def _extract_renderers(job_template: dict[str, Any]) -> set[str]:
 
 def _has_vray_standalone_steps(job_template: dict[str, Any]) -> bool:
     """Return whether the template contains direct V-Ray actions."""
-    return any(
-        action.get("command") == "vray"
-        for step in job_template.get("steps", [])
-        for action in step.get("script", {}).get("actions", {}).values()
-    )
+    for step in job_template.get("steps", []):
+        for action in step.get("script", {}).get("actions", {}).values():
+            if action.get("command") == "vray":
+                return True
+        for env in step.get("stepEnvironments", []):
+            if (
+                env.get("name") == "V-Ray Standalone"
+                or env.get("variables", {}).get("VRAY_RENDERER") == "vray"
+            ):
+                return True
+        for ef in step.get("script", {}).get("embeddedFiles", []):
+            if ef.get("filename") == "run_vray.sh":
+                return True
+    return False
 
 
 class HostCondaPackages:

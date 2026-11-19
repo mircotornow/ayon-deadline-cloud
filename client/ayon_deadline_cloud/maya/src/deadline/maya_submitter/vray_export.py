@@ -66,11 +66,17 @@ def vrscene_asset_paths(scene_path: Path) -> set[str]:
 def vrscene_referenced_asset_paths(scene_path: Path) -> set[str]:
     """Return existing file paths referenced by an exported V-Ray scene."""
     asset_paths: set[str] = set()
-    files_to_scan = [
-        path
-        for path in [scene_path, *scene_path.parent.glob(f"{scene_path.stem}.vrfiles")]
-        if path.is_file()
-    ]
+    files_to_scan: list[Path] = []
+    if scene_path.is_file():
+        files_to_scan.append(scene_path)
+    if scene_path.parent.is_dir():
+        for path in scene_path.parent.glob("*"):
+            if (
+                path.is_file()
+                and path.suffix.lower() in {".vrfiles", ".vrscene", ".vrdata"}
+                and path not in files_to_scan
+            ):
+                files_to_scan.append(path)
     for file_path in files_to_scan:
         try:
             contents = file_path.read_text(
@@ -101,6 +107,23 @@ def vrscene_referenced_asset_paths(scene_path: Path) -> set[str]:
                 continue
 
             candidate_str = raw.replace("\\\\", "/").replace("\\", "/")
+
+            # Support UDIM tile patterns
+            if "<udim>" in candidate_str.lower():
+                try:
+                    pattern_str = re.sub(r'<[^>]+>', '*', candidate_str)
+                    pattern_path = Path(pattern_str)
+                    search_dir = pattern_path.parent
+                    if not search_dir.is_absolute():
+                        search_dir = (file_path.parent / search_dir).resolve()
+                    if search_dir.is_dir():
+                        for matched in search_dir.glob(pattern_path.name):
+                            if matched.is_file():
+                                asset_paths.add(matched.resolve().as_posix())
+                except (OSError, ValueError):
+                    pass
+                continue
+
             try:
                 candidate = Path(candidate_str)
                 # Check absolute paths directly; resolve relative paths against the scene directory
