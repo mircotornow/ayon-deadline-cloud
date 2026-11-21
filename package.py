@@ -7,7 +7,7 @@ name = "deadline_cloud"
 title = "AWS Deadline Cloud"
 
 # Required: Valid semantic version (https://semver.org/)
-version = "0.0.1+ep29"
+version = "0.0.1+ep30"
 
 # Name of client code directory imported in AYON launcher
 # - do not specify if there is no client code

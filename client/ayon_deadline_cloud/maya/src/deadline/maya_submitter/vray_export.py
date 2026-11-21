@@ -27,9 +27,9 @@ def _make_home_paths_relative(scene_path: Path) -> None:
         path = Path(match.group(1))
         try:
             path.relative_to(home)
+            resolved = Path(os.path.relpath(path, scene_directory))
         except ValueError:
             return match.group(0)
-        resolved = Path(os.path.relpath(path, scene_directory))
         return f'"{resolved.as_posix()}"'
 
     contents = re.sub(r'"(' + re.escape(home) + r'/[^"]+)"', replace_path, contents)

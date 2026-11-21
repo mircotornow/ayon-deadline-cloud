@@ -247,15 +247,40 @@ def _get_job_template(
 
         if layer_data.renderer_name == "vray":
             vrscene_param_name = _vrscene_parameter_name(layer_data)
-            remap_python_script = """import json
+            remap_python_script = r"""import json
 import os
 import re
+import unicodedata
 import xml.etree.ElementTree as ET
 
 BS = chr(92)
+NL = chr(10)
+CR = chr(13)
+QT = chr(34)
+
 mapping_file = os.environ.get("MAPPING_FILE", "")
 vrscene = os.environ.get("VRSCENE_PATH", "")
 remap_out = os.environ.get("REMAP_OUTPUT", "")
+
+
+def norm_key(path_str):
+    return unicodedata.normalize("NFC", path_str).casefold()
+
+
+def normalize_slashes(path_str):
+    s = path_str.replace(BS, "/")
+    if s.startswith("//"):
+        return "//" + re.sub(r"/+", "/", s[2:])
+    return re.sub(r"/+", "/", s)
+
+
+def is_text_file(path_str):
+    try:
+        with open(path_str, "rb") as bf:
+            return b"\x00" not in bf.read(8192)
+    except OSError:
+        return False
+
 
 rules = []
 if mapping_file and os.path.exists(mapping_file):
@@ -274,9 +299,10 @@ for r in sorted(rules, key=lambda x: len(x.get("source_path", "")), reverse=True
     dst = r.get("destination_path", "").strip()
     if not src or not dst:
         continue
-    s_norm = src.replace(BS, "/").rstrip("/")
-    d_norm = dst.replace(BS, "/").rstrip("/")
-    norm_rules.append((s_norm.lower(), s_norm, d_norm))
+    s_norm = normalize_slashes(src).rstrip("/")
+    d_norm = normalize_slashes(dst).rstrip("/")
+    s_parts = [norm_key(p) for p in s_norm.split("/")]
+    norm_rules.append((s_parts, s_norm, d_norm))
     variants = set()
     variants.add(src)
     variants.add(src.replace(BS, "/"))
@@ -290,28 +316,153 @@ if remap_out:
     ET.ElementTree(root).write(remap_out, encoding="utf-8", xml_declaration=True)
     print(f"Generated V-Ray remap XML at: {remap_out}")
 
-if vrscene and os.path.exists(vrscene) and norm_rules:
-    try:
-        with open(vrscene, "r", encoding="utf-8", errors="surrogateescape") as f:
-            content = f.read()
+# Index all staged files and directories for case-insensitive + Unicode NFC resolution on Linux
+staged_files = {}
+staged_dirs = {}
+dir_entries = {}
+roots_to_index = []
+seen_roots = set()
 
-        def repl(m):
-            raw = m.group(1)
-            if chr(10) in raw or chr(13) in raw:
+for _, _, d_norm in norm_rules:
+    if d_norm and os.path.isdir(d_norm) and d_norm not in seen_roots:
+        seen_roots.add(d_norm)
+        roots_to_index.append(d_norm)
+
+scene_dir = ""
+if vrscene and os.path.exists(vrscene):
+    scene_dir = normalize_slashes(os.path.dirname(os.path.abspath(vrscene))).rstrip("/")
+    if scene_dir and os.path.isdir(scene_dir) and scene_dir not in seen_roots:
+        seen_roots.add(scene_dir)
+        roots_to_index.append(scene_dir)
+
+for root_dir in roots_to_index:
+    for dirpath, _, filenames in os.walk(root_dir):
+        dp = normalize_slashes(dirpath).rstrip("/")
+        staged_dirs[norm_key(dp)] = dp
+        dir_entries[dp] = filenames
+        for fn in filenames:
+            fp = dp + "/" + fn
+            staged_files[norm_key(fp)] = fp
+
+print(f"Indexed {len(staged_files)} staged files across {len(staged_dirs)} directories.")
+
+
+def resolve_on_disk(mapped_path):
+    clean = normalize_slashes(mapped_path)
+    key = norm_key(clean.rstrip("/"))
+    if key in staged_files:
+        return staged_files[key], True
+    if key in staged_dirs:
+        return staged_dirs[key], True
+    if os.path.exists(clean):
+        return clean, True
+
+    parts = clean.split("/")
+    for i in range(len(parts) - 1, 0, -1):
+        anc_key = norm_key("/".join(parts[:i]))
+        if anc_key in staged_dirs:
+            resolved_anc = staged_dirs[anc_key]
+            tail = parts[i:]
+            if len(tail) == 1 and "<udim>" in tail[0].lower():
+                fname = tail[0]
+                token_match = re.search(r"<udim>", fname, flags=re.IGNORECASE)
+                if token_match:
+                    prefix_k = norm_key(fname[:token_match.start()])
+                    suffix_k = norm_key(fname[token_match.end():])
+                    for actual_fn in dir_entries.get(resolved_anc, ()):
+                        m_tile = re.match(r"^(.*?)(\d{4,})([^0-9]*)$", actual_fn)
+                        if m_tile:
+                            a_pre, _, a_suf = m_tile.groups()
+                            if norm_key(a_pre) == prefix_k and norm_key(a_suf) == suffix_k:
+                                return resolved_anc + "/" + a_pre + token_match.group(0) + a_suf, True
+            return resolved_anc + "/" + "/".join(tail), False
+    return clean, False
+
+
+if vrscene and os.path.exists(vrscene) and (norm_rules or staged_files):
+    files_to_patch = []
+    seen_files = set()
+
+    def add_target(path_str):
+        ap = os.path.abspath(path_str)
+        if ap not in seen_files and os.path.isfile(ap) and is_text_file(ap):
+            seen_files.add(ap)
+            files_to_patch.append(ap)
+
+    add_target(vrscene)
+    if scene_dir and os.path.isdir(scene_dir):
+        for fn in sorted(os.listdir(scene_dir)):
+            ext = os.path.splitext(fn)[1].lower()
+            if ext in (".vrscene", ".vrfiles"):
+                add_target(os.path.join(scene_dir, fn))
+
+    total_remapped = 0
+    total_case_fixed = 0
+    unresolved_samples = []
+    patched_file_count = 0
+
+    for target_file in files_to_patch:
+        try:
+            with open(target_file, "r", encoding="utf-8", errors="surrogateescape") as f:
+                content = f.read()
+
+            file_changed = False
+
+            def repl(m):
+                global file_changed, total_remapped, total_case_fixed
+                raw = m.group(1)
+                if NL in raw or CR in raw or not raw or raw.startswith(("ZIPC", "HEX", "data:")):
+                    return m.group(0)
+
+                raw_norm = normalize_slashes(raw)
+                raw_parts = raw_norm.split("/")
+                raw_parts_k = [norm_key(p) for p in raw_parts]
+
+                for s_parts, _, d_norm in norm_rules:
+                    n = len(s_parts)
+                    if len(raw_parts_k) >= n and raw_parts_k[:n] == s_parts:
+                        rest_parts = raw_parts[n:]
+                        mapped = d_norm + ("/" + "/".join(rest_parts) if rest_parts else "")
+                        resolved, found = resolve_on_disk(mapped)
+                        total_remapped += 1
+                        if resolved != mapped:
+                            total_case_fixed += 1
+                        if not found and len(unresolved_samples) < 20:
+                            unresolved_samples.append(resolved)
+                        if resolved != raw:
+                            file_changed = True
+                        return QT + resolved + QT
+
+                # Also resolve relative paths against scene_dir if they match a staged file with different casing
+                if scene_dir and ("/" in raw_norm or BS in raw) and not raw_norm.startswith("/"):
+                    rel_abs = normalize_slashes(os.path.normpath(os.path.join(scene_dir, raw_norm)))
+                    rel_key = norm_key(rel_abs)
+                    if rel_key in staged_files:
+                        resolved = staged_files[rel_key]
+                        if resolved != raw:
+                            file_changed = True
+                            total_case_fixed += 1
+                        return QT + resolved + QT
+
                 return m.group(0)
-            raw_norm = raw.replace(BS, "/")
-            raw_lower = raw_norm.lower()
-            for s_lower, _, d in norm_rules:
-                if raw_lower.startswith(s_lower):
-                    return chr(34) + d + raw_norm[len(s_lower):] + chr(34)
-            return m.group(0)
 
-        patched = re.sub(r'"([^"]+)"', repl, content)
-        with open(vrscene, "w", encoding="utf-8", errors="surrogateescape") as f:
-            f.write(patched)
-        print("Successfully patched VRScene with local worker paths.")
-    except Exception as e:
-        print(f"Warning: failed to patch VRScene: {e}")
+            patched = re.sub(r'"([^"]+)"', repl, content)
+            if file_changed and patched != content:
+                with open(target_file, "w", encoding="utf-8", errors="surrogateescape") as f:
+                    f.write(patched)
+                patched_file_count += 1
+                print(f"Patched: {os.path.basename(target_file)}")
+        except Exception as e:
+            print(f"Warning: failed to patch {target_file}: {e}")
+
+    print(
+        f"VRScene remap summary: patched {patched_file_count}/{len(files_to_patch)} files, "
+        f"remapped {total_remapped} paths ({total_case_fixed} case/Unicode-corrected)."
+    )
+    if unresolved_samples:
+        print(f"Note: {len(unresolved_samples)} remapped paths not present on disk (may include render outputs):")
+        for sample in unresolved_samples:
+            print(f"  - {sample}")
 """
 
             vray_script = """#!/bin/bash
@@ -360,7 +511,11 @@ elif [ -z "${OCIO:-}" ] || [ ! -f "$OCIO" ]; then
     fi
 fi
 
-export VRAY_PATH_REMAPPING_CASE_SENSITIVE=0
+# Keep V-Ray path remapping case-sensitive on Linux: setting this to 0 causes
+# V-Ray 7.x to lowercase remapped paths (including .vrfiles entries), breaking
+# case-sensitive Linux lookups. Case-insensitive/Unicode resolution is handled
+# ahead of time by remap_vray.py against the actual staged filesystem.
+export VRAY_PATH_REMAPPING_CASE_SENSITIVE=1
 SCENE_DIR="$(cd "$(dirname "$VRSCENE_PATH")" && pwd)"
 export VRAY_ASSETS_PATH="${VRAY_ASSETS_PATH:-}:$SCENE_DIR:{{Session.WorkingDirectory}}"
 
